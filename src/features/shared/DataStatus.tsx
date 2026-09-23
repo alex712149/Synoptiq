@@ -1,0 +1,2 @@
+import { AlertTriangle, CloudCog } from "lucide-react";
+export function DataStatus({ mode, compact=false }: { mode:"live"|"mock"; compact?:boolean }) { return <div className={`status-pill ${mode === "live" ? "status-live" : "status-mock"}`} title={mode === "live" ? "Connected to the SkillBlend API" : "Using deterministic demonstration data"}>{mode === "live" ? <CloudCog/> : <AlertTriangle/>}<span>{compact ? (mode === "live" ? "Live" : "Replay data") : (mode === "live" ? "Live API connected" : "Demonstration data · API offline")}</span></div>; }

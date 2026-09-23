@@ -1,0 +1,29 @@
+# Core API
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pydantic>=2.7
+
+# Data / ML
+pandas>=2.2
+numpy>=1.26
+scikit-learn>=1.4
+joblib>=1.4
+
+# Preferred gradient-boosting backend (blueprint's recommendation).
+# The engine layer (app/engine/blend.py, app/engine/trust.py) automatically
+# falls back to sklearn.ensemble.HistGradientBoosting{Regressor,Classifier}
+# if lightgbm is not installed, so the app still runs without it - but
+# install it for the intended "fast iteration + interpretability" behavior.
+lightgbm>=4.3
+
+# Optional but recommended: real SHAP attributions instead of the
+# perturbation-based fallback in app/engine/explain.py.
+shap>=0.45
+
+# Optional: production Parquet storage (app/data/storage.py falls back to
+# a joblib pickle cache automatically if this isn't installed).
+pyarrow>=16.0
+
+# Testing
+pytest>=8.0
+httpx>=0.27

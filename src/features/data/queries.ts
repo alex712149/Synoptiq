@@ -1,0 +1,13 @@
+import { queryOptions } from "@tanstack/react-query";
+import { fixtureApi, liveApi, withFallback } from "./api";
+import type { RegionCode, Regime, Season, VariableName } from "./types";
+export const regionsQuery = queryOptions({ queryKey:["regions"], queryFn:() => withFallback(() => liveApi.regions(), fixtureApi.regions), staleTime: 300_000 });
+export const variablesQuery = queryOptions({ queryKey:["variables"], queryFn:() => withFallback(() => liveApi.variables(), fixtureApi.variables), staleTime: 300_000 });
+export const leadTimesQuery = queryOptions({ queryKey:["lead-times"], queryFn:() => withFallback(() => liveApi.leadTimes(), fixtureApi.leadTimes), staleTime: 300_000 });
+export const sourcesQuery = queryOptions({ queryKey:["sources"], queryFn:() => withFallback(() => liveApi.sources(), fixtureApi.sources), staleTime: 300_000 });
+export const blendQuery = (r:RegionCode,v:VariableName,l:number) => queryOptions({ queryKey:["blend",r,v,l], queryFn:() => withFallback(() => liveApi.blend(r,v,l), () => fixtureApi.blend(r,v,l)), retry:1 });
+export const weightsQuery = (r:RegionCode,v:VariableName,s:Season,g:Regime) => queryOptions({ queryKey:["weights",r,v,s,g], queryFn:() => withFallback(() => liveApi.weights(r,v,s,g), () => fixtureApi.weights(r,v,s,g)), retry:1 });
+export const verificationQuery = queryOptions({ queryKey:["verification"], queryFn:() => withFallback(() => liveApi.verification(), fixtureApi.verification), retry:1 });
+export const extremesQuery = (r:RegionCode,l:number) => queryOptions({ queryKey:["extremes",r,l], queryFn:() => withFallback(() => liveApi.extremes(r,l), () => fixtureApi.extremes(r,l)), retry:1 });
+export const replayEventsQuery = queryOptions({ queryKey:["replay-events"], queryFn:() => withFallback(() => liveApi.replayEvents(), fixtureApi.replayEvents), staleTime:300_000, retry:1 });
+export const replayEventQuery = (id:string) => queryOptions({ queryKey:["replay-event",id], queryFn:() => withFallback(() => liveApi.replayEvent(id), () => fixtureApi.replayEvent(id)), retry:1 });

@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+artifacts/cache/*
+artifacts/models/*
+artifacts/replay/*
+!artifacts/cache/.gitkeep
+!artifacts/models/.gitkeep
+!artifacts/replay/.gitkeep
+.env
