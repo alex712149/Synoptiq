@@ -1,62 +1,61 @@
-"""
-SkillBlend API - FastAPI application entrypoint.
-
-Run with:
-    uvicorn app.main:app --reload --port 8000
-
-Before first use, seed the synthetic historical dataset and train the
-models:
-    python -m scripts.seed_and_train
-
-Interactive docs at /docs once running.
-"""
 from __future__ import annotations
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import (
-    routes_forecast,
-    routes_health,
-    routes_regions,
-    routes_replay,
-    routes_skill,
-    routes_weights,
-)
+from app.database import Base, engine, SessionLocal
+from app.models_db import ForecastRow
+from app.routers import regions, forecast, verification, replay
+
+Base.metadata.create_all(bind=engine)
 
 app = FastAPI(
     title="SkillBlend API",
     description=(
-        "Hybrid AI-NWP Multi-Model Forecast Blending System - PS 26081 "
-        "(NCMRWF, Ministry of Earth Sciences). Learns which forecast "
-        "source to trust for a given place, lead time, season and "
-        "weather regime, then blends, bias-corrects, calibrates and "
-        "explains a single forecast product."
+        "Hybrid AI-NWP Multi-Model Forecast Blending System — SIH PS 26081 "
+        "(NCMRWF / Ministry of Earth Sciences). Learns which forecast source "
+        "to trust by region, lead time, season and weather regime, then "
+        "blends, bias-corrects, calibrates and explains the result."
     ),
     version="0.1.0",
 )
 
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    CORSMiddleware, allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
 )
 
-app.include_router(routes_health.router)
-app.include_router(routes_regions.router)
-app.include_router(routes_forecast.router)
-app.include_router(routes_weights.router)
-app.include_router(routes_skill.router)
-app.include_router(routes_replay.router)
+app.include_router(regions.router)
+app.include_router(forecast.router)
+app.include_router(verification.router)
+app.include_router(replay.router)
+
+
+@app.get("/health")
+def health():
+    db = SessionLocal()
+    try:
+        n = db.query(ForecastRow).count()
+    finally:
+        db.close()
+    return {
+        "status": "ok",
+        "forecast_rows_cached": n,
+        "note": "Run `bash scripts/bootstrap.sh` once if this is 0 — it seeds "
+                "synthetic data, trains the meta-model, and precomputes the "
+                "offline replay cache used as the default demo path.",
+    }
 
 
 @app.get("/")
 def root():
     return {
         "name": "SkillBlend API",
-        "problem_statement": "PS 26081 - Hybrid AI-NWP Multi-Model Forecast Blending System",
         "docs": "/docs",
-        "health": "/api/v1/health",
+        "quickstart": [
+            "GET /regions",
+            "GET /replay/events  (offline, demo-day-safe — start here)",
+            "GET /forecast/available?region=kerala_western_ghats",
+            "GET /forecast/blend?region=...&variable=precipitation&valid_time=...&lead_hours=72",
+            "GET /verification/scorecard?region=...",
+        ],
     }

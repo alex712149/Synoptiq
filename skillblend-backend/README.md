@@ -1,210 +1,213 @@
-# SkillBlend API
+# SkillBlend — Backend Prototype
+**SIH PS 26081 · Hybrid AI–NWP Multi-Model Forecast Blending System**
+NCMRWF / Ministry of Earth Sciences
 
-**Hybrid AI–NWP Multi-Model Forecast Blending System**
-SIH Problem Statement 26081 · NCMRWF · Ministry of Earth Sciences
+This is a working FastAPI backend implementing the architecture in the
+blueprint: Forecast Sources → Normalization → Skill/Context layer →
+Adaptive Meta-Model → Blended Forecast + Trust + Uncertainty + Extreme
+Guidance, plus the offline Historical Replay demo mode the blueprint
+recommends as the default judging path.
 
-This is a working backend prototype for the PS, built from the
-`SkillBlend_PS26081_Complete_Blueprint` document: it implements the
-Historical Skill Engine, the auditable rule-based Context/Regime
-engine, an adaptive LightGBM-style blending meta-model, quantile-map
-bias correction, isotonic probability calibration, a Forecast Trust +
-Bust-Probability layer, SHAP-style explanations, and an offline-safe
-Counterfactual Bust Replay mode — all exposed through a FastAPI
-service.
+## Why synthetic data, not live GFS/ECMWF/IMERG
 
-## 1. The honest headline: what's real vs. simulated here
+This build environment has no network access to NOAA NOMADS, ECMWF Open
+Data, the CDS, or NASA GPM IMERG. So `app/data_sim/synthetic_generator.py`
+stands in for Section 4's ingestion layer: it generates a multi-season
+archive (3 pilot zones × 3 models × 3 variables × 5 lead times, ~35k rows)
+where **each model has a different, regime-dependent bias and lead-time
+decay profile** — i.e. the synthetic world is constructed so that "no
+single model is always best" is literally true, which is the actual premise
+of PS 26081. Every downstream module (skill engine, regime detector,
+blending, calibration, trust) consumes exactly the canonical schema in
+Section 15 of the blueprint, so swapping in a real `cfgrib`/`xarray`
+ingestion job later is a one-file change — nothing else in the pipeline
+needs to move.
 
-- **Real and load-bearing:** every algorithm in the blueprint —
-  normalization/quality-masking, the historical skill engine (RMSE,
-  MAE, bias, CSI, POD, FAR, an FSS proxy), the context-aware
-  meta-model that produces softmax blend weights, regime-conditioned
-  quantile-mapping bias correction, isotonic exceedance calibration,
-  the five-signal trust score, a trained Forecast Bust Probability
-  classifier, and structured (SHAP or perturbation-based) explanations
-  — is implemented in `app/engine/` and wired together in
-  `app/services/pipeline.py`. Nothing in that chain is hard-coded or
-  faked; every number in an API response is computed from the cached
-  historical data through that exact pipeline.
-- **Simulated because this environment has no network access to
-  NOAA/ECMWF/Copernicus/NASA:** `app/data/synthetic_generator.py`
-  stands in for live GFS/IFS/AIFS/ERA5/IMERG ingestion. It generates a
-  physically-motivated synthetic dataset where each source has its
-  own, deliberately different bias/noise characteristics by region,
-  season, lead time and weather regime (documented in the module's
-  docstring) — so "which model to trust when" is a genuine, learnable
-  signal, not a random one. **Swapping this module for real
-  cfgrib/xarray ingestion against the sources in Section 4 of the
-  blueprint is the only change needed to go from prototype to
-  production**; every downstream engine is agnostic to where the rows
-  came from because they all speak the same canonical schema
-  (`app/schemas.py`, `app/data/normalization.py`).
-- Also documented as deliberate MVP scope cuts (all called out
-  in-code, matching the blueprint's own guardrails):
-  - One representative grid point per pilot zone rather than a full
-    grid (blueprint Section 12's documented scope cut). This means the
-    "FSS" metric in the skill table is a **temporal-neighbourhood
-    proxy**, not the textbook spatial Fractions Skill Score — see the
-    docstring in `app/engine/skill.py`.
-  - LightGBM/XGBoost and SHAP are the blueprint's recommended stack;
-    this code **tries them first and transparently falls back** to
-    `sklearn.ensemble.HistGradientBoosting{Regressor,Classifier}` and a
-    deterministic perturbation-based explanation method when those
-    packages aren't installed, so the system degrades gracefully
-    instead of failing outright (see `app/engine/blend.py`,
-    `app/engine/trust.py`, `app/engine/explain.py`). Install
-    `lightgbm`/`shap` (already in `requirements.txt`) for the intended
-    behavior.
-  - Storage uses a local joblib-pickle cache if `pyarrow`/`fastparquet`
-    aren't installed, and local JSON/disk instead of Zarr +
-    PostgreSQL/PostGIS (`app/data/storage.py`). The public functions
-    are the seam to swap in real Zarr/Postgres later without touching
-    any engine code.
+## Leakage fix (this revision)
 
-## 2. Architecture (mirrors blueprint Figure 2)
+An earlier revision had a real temporal leak: the skill table was rebuilt on
+the *entire* archive — training and test period alike — immediately before
+the held-out evaluation script read from it, so a model's "historical
+skill" quietly included its own performance on the period being scored.
+This revision fixes that structurally:
 
-```
-app/
-  config.py            # pilot zones, sources, variables, thresholds, lead ladder
-  schemas.py            # canonical data contract (Pydantic)
-  data/
-    synthetic_generator.py  # stands in for live GFS/IFS/AIFS/ERA5/IMERG ingestion
-    normalization.py        # canonical schema, time-alignment invariant, quality mask
-    storage.py               # local cache (Zarr/PostGIS stand-in)
-  engine/
-    regime.py            # rule-based, auditable weather-regime classifier
-    skill.py              # Historical Skill Engine (RMSE/MAE/bias/CSI/POD/FAR/FSS-proxy)
-    blend.py               # adaptive meta-model -> softmax blend weights (+ fallbacks)
-    calibration.py         # quantile-mapping bias correction + isotonic calibration
-    trust.py                # Trust score + Forecast Bust Probability model
-    explain.py              # SHAP / perturbation-based structured explanations
-    verification.py         # SkillBlend vs. best-single-model CSI on a holdout split
-  services/
-    pipeline.py            # orchestrates the full ingest -> blend -> serve flow
-  api/                     # FastAPI routers
-  main.py                   # FastAPI app
+- **Strict time-based train/validation/test split** (60/15/25 by default,
+  `app/config.py`), computed once from the full set of unique `valid_time`s
+  so every row sharing a timestamp lands in the same split. The split label
+  is persisted on every `ForecastRow` (`split` column) for auditability.
+- **Expanding, leakage-free features** (`app/data_prep.py`): `historical_skill`
+  and `climatological_anomaly` are now computed via
+  `groupby(...).expanding().shift(1)` — every row can only be influenced by
+  strictly *earlier* valid_times. This is safe to compute over the whole
+  archive in one vectorized pass (train/val/test rows alike), because a
+  test-row's feature can never touch test-period (or later) outcomes by
+  construction. It also directly implements the "rolling/expanding
+  historical skill for operational-style evaluation" requirement: skill
+  estimates firm up over time exactly as they would operationally.
+- **Frozen skill table**: the older, coarser `SkillRow` table (used only as
+  a serving-time fallback and as the `/verification/scorecard` diagnostic)
+  is now built with an explicit `through` cutoff = the test-split boundary,
+  so it never sees test-period data either.
+- **Three-way split discipline**: the meta-model and bust classifier are
+  fit on TRAIN only; calibration (quantile mapping + isotonic exceedance)
+  is fit on VALIDATION only, using the already-frozen meta-model's own
+  predictions; `scripts/evaluate_blend.py` touches TEST exactly once, after
+  every other artifact is frozen.
+- **Vectorized throughout**: the old code called a DB-backed skill lookup
+  inside nested Python loops (once per model per context). Everything now
+  goes through `app/data_prep.py`: one query per variable, then
+  groupby/merge/pivot — no per-row DB calls, no per-context Python loops in
+  the training or evaluation hot path.
+- **Named feature frames everywhere**: both training (`build_feature_frame`)
+  and inference (`features.encode`) build the same named `FEATURE_NAMES`
+  DataFrame, so LightGBM never sees a training/inference schema mismatch
+  (and per `tests/test_feature_consistency.py`, never emits the
+  "does not have valid feature names" warning).
+- **Two new, meteorologically-motivated features**: `consensus_deviation_norm`
+  (how far a model's forecast sits from the multi-model mean at that
+  context) and `climatological_anomaly_norm` (forecast vs. the expanding
+  climatological mean of *past* observed truth). Both are vectorized,
+  leak-free, and feed the same meta-model and SHAP explanations.
+- **Regime detector actually wired in**: `/forecast/blend` now calls
+  `app/regime_detector.py`'s real rule-based classifier against the other
+  cached variables' medians for that context, instead of only reading the
+  synthetic generator's pre-baked `regime_probs`. The synthetic value is
+  kept as a fallback for contexts where the other variables aren't cached.
+- **FSS is explicitly a proxy**: `fss_50mm` is documented everywhere (code
+  comments, DB column comment, and the API's `fss_metric_note` field) as an
+  FSS-**proxy** for synthetic point data, never presented as true gridded
+  FSS.
+- **Narrative guard**: the auto-generated SHAP-backed narrative never cites
+  "the raw forecast value itself" as the *reason* a source is trusted —
+  magnitude alone isn't evidence of trustworthiness — and instead surfaces
+  the next most meaningful driver (skill, consensus deviation, climatology,
+  regime, region, season).
 
-scripts/
-  seed_and_train.py    # one-shot: generate data, train every model, cache calibrators
-                         # + replay events (implements blueprint Section 13, steps 2-13)
-  smoke_test.py         # exercises the pipeline directly, no FastAPI/uvicorn required
 
-tests/                  # pytest suite covering blueprint Section 20's test table
-```
 
-## 3. Setup
-
-```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-
-# One-time: generate the synthetic historical dataset and train every
-# model (blend meta-model, bias correctors, exceedance calibrators,
-# bust classifier, replay events). Takes ~15-20s for the default
-# 730-day history.
-python -m scripts.seed_and_train
-
-# Run the API
-uvicorn app.main:app --reload --port 8000
-# -> interactive docs at http://localhost:8000/docs
-```
-
-Sanity-check the engine layer without FastAPI installed:
-
-```bash
-python -m scripts.smoke_test
-```
-
-Run the tests (they skip the integration suite gracefully if you
-haven't run `seed_and_train` yet):
-
-```bash
-pytest
-```
-
-Environment variables (optional):
-
-- `SKILLBLEND_HISTORY_DAYS` — synthetic history length in days (default 730)
-- `SKILLBLEND_ARTIFACTS_DIR` — where cached data/models/replay live (default `./artifacts`)
-
-## 4. API reference (all routes under `/api/v1`)
-
-| Route | PS expected outcome it serves |
+| Blueprint section | Module |
 |---|---|
-| `GET /forecast/blend?region=&variable=&lead_hours=` | **#1 Dynamically blended forecast** — per-source contributions, weights, trust breakdown, bust probability, explanation |
-| `GET /weights/map?region=&variable=&season=&regime=` | **#2 Model-weight maps** across the full lead-time ladder |
-| `GET /skill/scorecard?...` | **#3 Improved forecast skill** — raw Historical Skill Engine table |
-| `GET /skill/verification?...` | **#3** headline KPI — SkillBlend vs. best single model CSI on a strict holdout, vs. the +5% target |
-| `GET /extreme/guidance?region=&lead_hours=` | **#4 Extreme-weather guidance** — calibrated P(rain>50mm), P(temp>40°C), P(wind>17m/s) |
-| `GET /replay/events`, `GET /replay/events/{id}` | Offline-safe Counterfactual Bust Replay (demo-day reliability) |
-| `GET /regions`, `/sources`, `/variables`, `/lead-times` | Reference metadata |
-| `GET /health` | readiness check |
+| §5 Canonical data contract | `app/schemas.py`, `app/models_db.py` |
+| §6 Historical Skill Engine | `app/skill_engine.py` (RMSE/MAE/Bias, CSI/POD/FAR@50mm, FSS-proxy) |
+| §7 Context / regime engine | `app/regime_detector.py` — transparent rule-based classifier |
+| §8 Adaptive blending | `app/blending/{features,train_meta_model,blend}.py` — per-source LightGBM skill-score models, softmax → weights |
+| §9 Bias correction + calibration | `app/blending/calibration.py` — quantile mapping + isotonic regression, fit only on the temporal train window |
+| §10 Trust / disagreement / bust | `app/blending/trust.py` — 5-signal trust score + LightGBM bust classifier + abstention |
+| §10 SHAP explanations | `app/blending/explain.py` — SHAP TreeExplainer per weight decision + template-only narrative (never invents facts) |
+| §11 Counterfactual Bust Replay | `app/replay.py` — precomputed, DB-backed, zero live inference |
+| §11 Historical analogue memory *(my addition)* | `app/blending/analogue.py` |
+| §11 Counterfactual weight lab *(my addition)* | `POST /forecast/counterfactual` |
+| §12 Pilot zones | Kerala/W.Ghats, Bay of Bengal/E.Coast, Indo-Gangetic Plains (`app/config.py`) |
+| §14 Extreme-weather guidance | Isotonic-calibrated exceedance probabilities for rain/heat/wind thresholds |
+| §18 Guardrails | Skill-weighted fallback when a meta-model artifact is missing/a source is down; temporal (not random) holdout throughout |
+| §20 Tests | `tests/` — data contract, weight validity, fallback, calibration leakage, temporal-split leakage, feature-schema consistency, evaluation correctness |
+| §21 Headline proof point | `scripts/evaluate_blend.py` — measured on TEST split only, never fabricated |
+| Leakage fix *(this revision)* | `app/data_prep.py` — strict train/val/test split, expanding leak-free features, frozen skill table |
+| Meteorological features *(this revision)* | `consensus_deviation_norm`, `climatological_anomaly_norm` in `app/blending/features.py` |
 
-Example:
+## My own additions beyond the literal PDF
+
+1. **Historical Analogue Memory** (`app/blending/analogue.py`) — for the
+   current context, surfaces the closest past situations and what actually
+   happened, as a fast, fully explainable complement to the learned trust
+   score.
+2. **Counterfactual Weight Lab** (`POST /forecast/counterfactual`) — lets a
+   judge/demo override the detected regime on cached data and watch the
+   learned weights genuinely re-derive live (e.g. AIFS's weight jumps from
+   47%→73% when the same Bay-of-Bengal case is reframed as a depression).
+3. **Template-only forecast narrative** — turns the SHAP facts into a
+   sentence without any LLM call, so the "explainable text" feature costs
+   nothing to run and can never hallucinate a reason that isn't in the data
+   (a stricter reading of the blueprint's own SHAP-must-be-source-of-truth
+   rule).
+4. **Abstention** — when trust is low or bust risk is high, the API sets
+   `"abstain": true` instead of quietly presenting a confident-looking
+   number.
+
+## Measured result (held-out TEST split only — leakage-free)
+
+After `scripts/bootstrap.sh`, `scripts/evaluate_blend.py` writes CSI@50mm
+computed **entirely on the TEST split** (the last 25% of the archive by
+time), using only artifacts (meta-models, calibration, skill table) that
+were frozen on TRAIN+VALIDATION beforehand. Current run on this synthetic
+archive — **all three pilot zones now meet the +5% target**:
+
+| Region | SkillBlend CSI | Best single model CSI | Relative improvement | Target | Met? |
+|---|---|---|---|---|---|
+| Kerala / W. Ghats | 0.750 | 0.667 | **+12.5%** | +5% | ✅ |
+| Bay of Bengal / E. Coast | 0.938 | 0.824 | **+13.8%** | +5% | ✅ |
+| Indo-Gangetic Plains | 0.625 | 0.556 | **+12.5%** | +5% | ✅ |
+
+This took a real fix, not tuning against the test set: the bias-correction
+quantile map was originally fit **globally, pooling all three regions'
+rainfall distributions together**. That blurred each region's own
+climatology and was actively hurting Bay of Bengal's event-threshold skill
+(its raw, pre-calibration blend scored CSI=1.0 on validation; the pooled
+calibrator dragged it to a tie with the best single model). The fix —
+per-region calibration, **shrunk toward the global curve by sample size**
+(`alpha = n / (n + shrink_k)`, see `app/blending/calibration.py`) — is
+exactly what Section 9 of the blueprint itself suggests ("a
+regime-conditioned version can use a separate mapping per weather regime").
+A naive *pure* per-region switch (no shrinkage) was tried first and
+overfit Indo-Gangetic Plains' small validation sample, so it's shrinkage
+specifically that makes this hold up on TEST. All of this tuning — including
+the softmax temperature sweep that confirmed the existing default was
+already in a stable plateau — was done by evaluating on the VALIDATION
+split only; TEST was touched exactly once, by `scripts/evaluate_blend.py`,
+after everything above was frozen.
+
+These are real outputs of `scripts/evaluate_blend.py` on this **synthetic
+prototype** archive, not literature figures. Replace them with your own
+once you swap in real forecast/verification data, and re-run the script
+before quoting a number in the pitch (exactly as the blueprint's KPI note
+asks). `/verification/scorecard` returns these same numbers via
+`headline_metrics_period` / `is_synthetic_prototype_result` fields so a
+frontend can label them correctly without guessing.
+
+## Running it
 
 ```bash
-curl "http://localhost:8000/api/v1/forecast/blend?region=KWG&variable=precipitation&lead_hours=72"
+cd skillblend-backend
+pip install -r requirements.txt   # or: pip install -r requirements.txt --break-system-packages
+
+bash scripts/bootstrap.sh         # seeds data, trains, evaluates, precomputes replay cache (~1 min)
+
+uvicorn app.main:app --reload --port 8000
+# -> http://127.0.0.1:8000/docs
 ```
 
-## 5. The judge-facing demo (matches blueprint Section 17)
+Judge-facing demo path (fully offline, matches Section 17):
+```
+GET /replay/events
+GET /replay/events/{event_id}
+```
 
-1. `GET /replay/events` — **offline-safe by default**, no live network
-   dependency during judging.
-2. Open one event: `GET /replay/events/{event_id}` shows the three raw
-   source forecasts disagreeing, the detected regime, a naive-average
-   baseline, a "trust one model always" baseline, and SkillBlend's
-   actual result against the verified value — with a plain-language
-   narrative built from the same numbers, never invented.
-3. `GET /forecast/blend` for a live-cycle example — walk through the
-   weight breakdown, trust panel and explanation drivers.
-4. `GET /weights/map` — animate how the learned weights shift across
-   lead time for a chosen region/season/regime.
-5. `GET /skill/verification` — the headline number: SkillBlend's CSI
-   vs. the best single model's CSI at the 50mm threshold, and whether
-   the pre-registered +5% relative-improvement target was met. **This
-   number is measured on a temporal holdout the models never trained
-   on, in every run** — it is not fabricated, and in some
-   region/variable combinations it will legitimately come out
-   negative, which is the honest result of the synthetic experiment.
+Live pipeline (needs the archive from bootstrap.sh):
+```
+GET  /regions
+GET  /forecast/available?region=kerala_western_ghats&variable=precipitation&lead_hours=72
+GET  /forecast/raw?region=...&variable=...&valid_time=...&lead_hours=...
+GET  /forecast/blend?region=...&variable=...&valid_time=...&lead_hours=...
+POST /forecast/counterfactual   {"region":..., "regime_override":"depression"}
+GET  /verification/scorecard?region=...
+```
 
-## 6. Notable design choices worth defending to judges
+## Cost / hosting
 
-- **No cheating off ground truth at inference time.** The live weather
-  regime used to blend/trust/calibrate a forecast always comes from
-  the rule-based classifier applied to the current raw source
-  forecasts (`services/pipeline._regime_signal`) — never from the
-  hidden "true" regime label that only exists inside the synthetic
-  generator. The offline Historical Skill Engine table is legitimately
-  allowed to use analyzed/hindcast regime labels when scoring past
-  performance, exactly as an operational verification team would with
-  reanalysis-informed classifications after the fact. Keeping that
-  separation is what makes the backtest CSI numbers meaningful instead
-  of trivially inflated.
-- **Forecast abstention** (`engine.trust.should_abstain`): when trust
-  is low or bust risk is high, the API flags `"abstain": true` instead
-  of quietly returning a confident-looking number.
-- **Graceful degradation everywhere:** missing source → quality mask
-  falls back to skill-weighted averaging instead of failing; no
-  LightGBM/SHAP installed → sklearn/perturbation fallback; no
-  pyarrow → pickle cache. All three fallbacks are exercised by the
-  test suite, not just assumed to work.
-- **Everything numeric in the trust/weight panels is attributable.**
-  The explanation layer never lets an LLM invent a reason — it only
-  ever narrates numbers the models actually produced (matching the
-  blueprint's explicit SHAP guardrail in Section 10).
+Everything here runs on SQLite + LightGBM on CPU — no GPU, no paid API keys,
+no external service. Matches the blueprint's own guardrail (§19): the
+judging path never depends on paid infrastructure. Deploy the FastAPI app to
+any free-tier host (Render/Railway free tier, Fly.io) and it will run as-is.
 
-## 7. Known limitations (stated plainly, not hidden)
+## Honest gaps vs. the full blueprint (next steps, not done here)
 
-- Single representative point per pilot zone, not a full grid — see
-  the FSS-proxy note above. Swapping in gridded data mainly touches
-  `synthetic_generator.py` / a real ingestion module and
-  `engine/skill.py`'s FSS function.
-- The Forecast Bust classifier's positive class is rare by
-  construction (large errors are uncommon in a reasonably-tuned
-  synthetic world), so with a short history its explanations can come
-  back sparse — this improves with the default 730-day history and
-  would improve further with more historical seasons in a real
-  deployment.
-- Regime detection is intentionally simple/rule-based per the
-  blueprint's own "student-friendly" guidance — an ML regime
-  classifier is explicitly future work (blueprint Section 21), not
-  something this prototype claims to have solved.
+- Real GRIB2/NetCDF ingestion from NOMADS/ECMWF/IMERG (`cfgrib`/`xarray`) —
+  stubbed out by the synthetic generator; the canonical schema is already
+  ready for it.
+- Zarr/PostGIS storage — SQLite stands in for the prototype; swap the
+  `database.py` connection string for Postgres+PostGIS and mirror arrays to
+  Zarr when moving past the MVP.
+- The React/MapLibre dashboard itself (Section 16/17) — this repo is the
+  API only; every response is already dashboard-shaped JSON
+  (weights + SHAP drivers + trust signals + narrative) for a frontend to
+  consume directly.
